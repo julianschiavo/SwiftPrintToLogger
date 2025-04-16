@@ -127,9 +127,56 @@ extension TriviaPiece {
 class PrintToLoggerRewriter: SyntaxRewriter {
     let moduleName: String
     private var currentTypeName: String?
+    private var currentTypeKind: SyntaxKind? // Added to track type kind
 
     init(moduleName: String) {
         self.moduleName = moduleName
+    }
+
+    // Helper to find enclosing type and if inside a closure
+    private func findEnclosingContext(startNode: Syntax) -> (typeName: String?, typeKind: SyntaxKind?, isInClosure: Bool) {
+        var current: Syntax? = startNode.parent
+        var enclosingTypeName: String? = nil
+        var enclosingTypeKind: SyntaxKind? = nil
+        var isInClosure = false
+
+        while let node = current {
+            // Check for closures first
+            if !isInClosure && node.is(ClosureExprSyntax.self) {
+                isInClosure = true
+                // Don't break here, continue searching upwards for the type
+            }
+
+            // Check for type declarations
+            if enclosingTypeName == nil { // Only find the *innermost* enclosing type
+                if let classDecl = node.as(ClassDeclSyntax.self) {
+                    enclosingTypeName = classDecl.name.text
+                    enclosingTypeKind = .classDecl
+                    // Don't break, continue checking for closures further up if needed
+                } else if let structDecl = node.as(StructDeclSyntax.self) {
+                    enclosingTypeName = structDecl.name.text
+                    enclosingTypeKind = .structDecl
+                    // Don't break
+                } else if let enumDecl = node.as(EnumDeclSyntax.self) {
+                    enclosingTypeName = enumDecl.name.text
+                    enclosingTypeKind = .enumDecl
+                    // Don't break
+                } else if let actorDecl = node.as(ActorDeclSyntax.self) {
+                    enclosingTypeName = actorDecl.name.text
+                    enclosingTypeKind = .actorDecl
+                    // Don't break
+                }
+            }
+
+            // If we've found the type AND determined if we are in a closure, we can potentially stop early,
+            // but iterating all the way up is safer to catch all closure contexts.
+            // if enclosingTypeName != nil && isInClosure { break }
+
+            current = node.parent
+        }
+        // Return ONLY the directly found context from walking the tree.
+        // Remove fallback to self.currentTypeName/currentTypeKind.
+        return (typeName: enclosingTypeName, typeKind: enclosingTypeKind, isInClosure: isInClosure)
     }
 
     override func visit(_ node: FunctionCallExprSyntax) -> ExprSyntax {
@@ -137,6 +184,21 @@ class PrintToLoggerRewriter: SyntaxRewriter {
               called.baseName.text == "print" else {
             return super.visit(node)
         }
+
+        let context = findEnclosingContext(startNode: Syntax(node))
+
+        // Only replace print if we are reasonably sure a 'logger' is in scope (i.e., inside a type we modify)
+        // Relax the guard: Allow replacement if we found an enclosing type OR if we are inside a Task/closure
+        let enclosingTypeFound = context.typeKind != nil && context.typeName != nil
+        let isInsideTaskClosure = context.isInClosure
+        guard enclosingTypeFound || isInsideTaskClosure else {
+            // print("Skipping print replacement outside of a recognized type or Task/closure context.") // DEBUG
+            return super.visit(node) // Don't replace if not inside a processed type or detected closure
+        }
+
+        // If typeName wasn't found by walking up, but we are in a closure, we might need it for struct/enum prefix.
+        // However, assuming Task/closures are primarily used in classes/actors where `self.` is needed anyway.
+        let containingTypeName = context.typeName // Might be nil if only isInsideTaskClosure is true
 
         // Determine log level based on context and content
         var logLevel = "info" // Default level
@@ -234,10 +296,43 @@ class PrintToLoggerRewriter: SyntaxRewriter {
             }
         }
         
+        // Determine logger call prefix
+        var loggerPrefix = ""
+
+        switch context.typeKind {
+        case .structDecl, .enumDecl:
+            // Structs and Enums use static logger: TypeName.logger
+            // This requires containingTypeName to be non-nil.
+            if let name = containingTypeName {
+                loggerPrefix = name + "."
+            } else {
+                // Cannot form TypeName.logger, fallback or skip?
+                // For now, assume this case doesn't happen with isInsideTaskClosure = true
+                // If it did, we might want to skip the replacement entirely.
+                loggerPrefix = "" // Fallback: might be wrong
+            }
+        case .classDecl, .actorDecl:
+            // Classes and Actors use self.logger inside closures OR Task blocks
+            if context.isInClosure || isInsideTaskClosure { // Use self. if in a detected closure or Task block
+                loggerPrefix = "self."
+            } else {
+                 // Direct method calls use implicit self
+                 loggerPrefix = ""
+            }
+        default: // Handles case where context.typeKind is nil
+             // If we are here because isInsideTaskClosure was true, assume class/actor context and use `self.`
+             if isInsideTaskClosure {
+                 loggerPrefix = "self."
+             } else {
+                 // Should not happen based on the guard logic, default to no prefix
+                 loggerPrefix = ""
+             }
+        }
+
         // Use the determined log level directly as the method name.
         // os.Logger has methods like .warning(), .error(), .info(), etc.
-        let loggerMethod = logLevel 
-        let loggerCallCode = "logger.\(loggerMethod)(\(logMessageCode))"
+        let loggerMethod = logLevel
+        let loggerCallCode = "\(loggerPrefix)logger.\(loggerMethod)(\(logMessageCode))"
 
         var newCallExpr: ExprSyntax = ExprSyntax("\(raw: loggerCallCode)")
         if let firstToken = node.firstToken(viewMode: .sourceAccurate),
@@ -263,7 +358,11 @@ class PrintToLoggerRewriter: SyntaxRewriter {
 
     override func visit(_ node: ClassDeclSyntax) -> DeclSyntax {
         self.currentTypeName = node.name.text
+        self.currentTypeKind = node.kind // Track kind
         guard let transformedClass = super.visit(node).as(ClassDeclSyntax.self) else {
+            // Clear context before returning
+            self.currentTypeName = nil
+            self.currentTypeKind = nil
             return DeclSyntax(node)
         }
 
@@ -295,7 +394,8 @@ class PrintToLoggerRewriter: SyntaxRewriter {
                    decl.is(ClassDeclSyntax.self) || 
                    decl.is(StructDeclSyntax.self) || 
                    decl.is(EnumDeclSyntax.self) ||
-                   decl.is(TypeAliasDeclSyntax.self) {
+                   decl.is(TypeAliasDeclSyntax.self) || // Added Actor
+                   decl.is(ActorDeclSyntax.self) {      // Added Actor
                     firstNonVarDeclIndex = index
                 }
             }
@@ -306,12 +406,14 @@ class PrintToLoggerRewriter: SyntaxRewriter {
         let typeName = transformedClass.name.text
 
         if let existingLoggerDecl = loggerVarDecl, let index = loggerMemberIndex {
-            // Logger exists, modify it if needed
+            // Logger exists, modify it if needed (ONLY subsystem)
+            // DO NOT change protection level or add/remove static here
             guard var binding = existingLoggerDecl.bindings.first, // Assume single binding logger = ...
-                  let initializer = binding.initializer, 
+                  let initializer = binding.initializer,
                   var callExpr = initializer.value.as(FunctionCallExprSyntax.self) else {
                 // Malformed logger declaration, skip modification
-                self.currentTypeName = nil 
+                self.currentTypeName = nil
+                self.currentTypeKind = nil
                 return DeclSyntax(transformedClass) // Return unchanged
             }
 
@@ -322,113 +424,60 @@ class PrintToLoggerRewriter: SyntaxRewriter {
             for (argIndex, arg) in callExpr.arguments.enumerated() {
                 if arg.label?.text == "subsystem" {
                     subsystemArgExists = true
-                    // Check if the value needs updating - safer comparison
-                    if let stringLiteral = arg.expression.as(StringLiteralExprSyntax.self) {
-                        if stringLiteral.segments.description != moduleName {
-                            needsModification = true
-                        }
-                    } else {
-                        // If it's not a simple string literal, assume modification needed?
-                        // Or compare description as fallback? For now, assume non-match.
-                        needsModification = true 
+                    // Check if the value needs updating
+                    if arg.expression.description != "\"\(moduleName)\"" {
+                         needsModification = true
+                         let newExpr = StringLiteralExprSyntax(content: moduleName)
+                         let updatedArg = arg.with(\.expression, ExprSyntax(newExpr))
+                         let listIndex = updatedArgs.index(updatedArgs.startIndex, offsetBy: argIndex)
+                         updatedArgs[listIndex] = updatedArg
                     }
-                    
-                    if needsModification {
-                        let newExpr = StringLiteralExprSyntax(content: moduleName)
-                         // Use the correct keypath for the LabeledExprSyntax
-                        let updatedArg = arg.with(\.expression, ExprSyntax(newExpr))
-                        let listIndex = updatedArgs.index(updatedArgs.startIndex, offsetBy: argIndex)
-                        updatedArgs[listIndex] = updatedArg // Directly update the mutable list
-                    }
-                    break // Found subsystem, no need to check further args
+                    break // Found subsystem
                 }
             }
 
             if !subsystemArgExists {
-                // Add the subsystem argument
-                let subsystemExpr = LabeledExprSyntax(label: "subsystem",
+                // Add the subsystem argument at the beginning
+                var subsystemExpr = LabeledExprSyntax(label: "subsystem",
                                                       colon: .colonToken(trailingTrivia: .space),
                                                       expression: ExprSyntax(StringLiteralExprSyntax(content: moduleName)))
-                // Append the new argument, ensuring correct trivia if list wasn't empty
-                 if updatedArgs.isEmpty {
-                    updatedArgs.append(subsystemExpr)
-                } else {
-                    // Add comma and space to previous last argument's trailing trivia
-                    if var lastArg = updatedArgs.last, let lastIndex = updatedArgs.indices.last {
-                       let commaToken = TokenSyntax.commaToken(trailingTrivia: .space)
-                       lastArg = lastArg.with(\.trailingComma, commaToken)
-                       updatedArgs[lastIndex] = lastArg
-                    }
-                    updatedArgs.append(subsystemExpr)
-                }
+                if !updatedArgs.isEmpty { subsystemExpr = subsystemExpr.with(\.trailingComma, .commaToken(trailingTrivia: .space)) }
+                updatedArgs.insert(subsystemExpr, at: updatedArgs.startIndex)
                 needsModification = true
             }
 
             if needsModification {
-                // Reconstruct the FunctionCallExprSyntax with the updated arguments
-                let newCallExpr = FunctionCallExprSyntax(
-                    calledExpression: callExpr.calledExpression,
-                    leftParen: callExpr.leftParen,
-                    arguments: updatedArgs, // Use the modified list
-                    rightParen: callExpr.rightParen,
-                    trailingClosure: callExpr.trailingClosure,
-                    additionalTrailingClosures: callExpr.additionalTrailingClosures
-                )
-                
-                // Reconstruct the InitializerClauseSyntax
-                let equalToken = initializer.equal.with(\.leadingTrivia, .space).with(\.trailingTrivia, Trivia())
-                let newInitializer = InitializerClauseSyntax(equal: equalToken, value: ExprSyntax(newCallExpr))
+                 // Reconstruct ONLY if the subsystem was wrong or missing
+                let newCallExpr = callExpr.with(\.arguments, updatedArgs)
+                let newInitializer = initializer.with(\.value, ExprSyntax(newCallExpr))
+                let newBinding = binding.with(\.initializer, newInitializer)
+                let newLoggerDecl = existingLoggerDecl.with(\.bindings, [newBinding]) // Assuming single binding
 
-                // Reconstruct the PatternBindingSyntax
-                let patternWithoutTrivia = binding.pattern.with(\.trailingTrivia, Trivia())
-                let newBinding = PatternBindingSyntax(
-                    pattern: patternWithoutTrivia,
-                    typeAnnotation: binding.typeAnnotation,
-                    initializer: newInitializer,
-                    accessorBlock: binding.accessorBlock,
-                    trailingComma: binding.trailingComma
-                )
-
-                // Reconstruct the VariableDeclSyntax, ensuring 'private' for classes
-                var finalModifiers = existingLoggerDecl.modifiers
-                let privateExists = finalModifiers.contains { $0.name.tokenKind == .keyword(.private) }
-                if !privateExists {
-                    let privateModifier = DeclModifierSyntax(name: .keyword(.private), trailingTrivia: .space)
-                    finalModifiers.insert(privateModifier, at: finalModifiers.startIndex)
-                }
-
-                let newLoggerDecl = VariableDeclSyntax(
-                    attributes: existingLoggerDecl.attributes,
-                    modifiers: finalModifiers,
-                    bindingSpecifier: existingLoggerDecl.bindingSpecifier
-                ) { 
-                    newBinding // Use the new binding
-                }
-
-                // Replace the old member in the list
                 let memberIndex = updatedMembers.index(updatedMembers.startIndex, offsetBy: index)
                 updatedMembers[memberIndex] = MemberBlockItemSyntax(decl: DeclSyntax(newLoggerDecl))
                 
-                // Reconstruct MemberBlock and ClassDecl
                  let newMemberBlock = MemberBlockSyntax(members: updatedMembers)
                  let updatedClass = transformedClass.with(\.memberBlock, newMemberBlock)
                  self.currentTypeName = nil
+                 self.currentTypeKind = nil
                 return DeclSyntax(updatedClass)
             } else {
                  // Logger exists and is correct, return unchanged
                 self.currentTypeName = nil
+                self.currentTypeKind = nil
                 return DeclSyntax(transformedClass)
             }
 
         } else {
-            // Logger does not exist, insert a new one
-            let loggerDeclCode = "private let logger = Logger(subsystem: \"\(moduleName)\", category: \"\(typeName)\")"
+            // Logger does not exist, insert a new one: internal let logger = ...
+            let loggerDeclCode = "internal let logger = Logger(subsystem: \"\(moduleName)\", category: \"\(typeName)\")"
             let loggerMember: MemberBlockItemSyntax
             do {
                 guard let stmt = try? Parser.parse(source: loggerDeclCode).statements.first,
                       let varDecl = stmt.item.as(VariableDeclSyntax.self) else {
-                    fputs("Error parsing logger variable declaration for \(typeName)\n", stderr)
+                    fputs("Error parsing logger variable declaration for class \(typeName)\\n", stderr)
                     self.currentTypeName = nil
+                    self.currentTypeKind = nil
                     return DeclSyntax(transformedClass) // Return unchanged on error
                 }
                 loggerMember = MemberBlockItemSyntax(decl: varDecl)
@@ -490,13 +539,161 @@ class PrintToLoggerRewriter: SyntaxRewriter {
             let newMemberBlock = transformedClass.memberBlock.with(\.members, updatedMembers)
             let updatedClass = transformedClass.with(\.memberBlock, newMemberBlock)
             self.currentTypeName = nil
+            self.currentTypeKind = nil
             return DeclSyntax(updatedClass)
+        }
+    }
+
+    // --- Add visit for ActorDeclSyntax ---
+    override func visit(_ node: ActorDeclSyntax) -> DeclSyntax {
+        self.currentTypeName = node.name.text
+        self.currentTypeKind = node.kind // Track kind
+        guard let transformedActor = super.visit(node).as(ActorDeclSyntax.self) else {
+            // Clear context before returning
+            self.currentTypeName = nil
+            self.currentTypeKind = nil
+            return DeclSyntax(node)
+        }
+
+        var loggerVarDecl: VariableDeclSyntax? = nil
+        var loggerMemberIndex: Int? = nil
+        var firstNonVarDeclIndex: Int? = nil
+
+        for (index, member) in transformedActor.memberBlock.members.enumerated() {
+            let decl = member.decl
+            if loggerVarDecl == nil, let varDecl = decl.as(VariableDeclSyntax.self) {
+                for binding in varDecl.bindings {
+                    if let pattern = binding.pattern.as(IdentifierPatternSyntax.self), pattern.identifier.text == "logger" {
+                        loggerVarDecl = varDecl
+                        loggerMemberIndex = index
+                    }
+                }
+            }
+            if firstNonVarDeclIndex == nil {
+                if decl.is(FunctionDeclSyntax.self) || decl.is(InitializerDeclSyntax.self) ||
+                   decl.is(SubscriptDeclSyntax.self) || decl.is(ClassDeclSyntax.self) ||
+                   decl.is(StructDeclSyntax.self) || decl.is(EnumDeclSyntax.self) ||
+                   decl.is(TypeAliasDeclSyntax.self) || decl.is(ActorDeclSyntax.self) {
+                    firstNonVarDeclIndex = index
+                }
+            }
+        }
+
+        var updatedMembers = transformedActor.memberBlock.members
+        let typeName = transformedActor.name.text
+
+        if let existingLoggerDecl = loggerVarDecl, let index = loggerMemberIndex {
+            // Logger exists, modify ONLY subsystem if needed
+             guard var binding = existingLoggerDecl.bindings.first,
+                   let initializer = binding.initializer,
+                   var callExpr = initializer.value.as(FunctionCallExprSyntax.self) else {
+                 self.currentTypeName = nil
+                 self.currentTypeKind = nil
+                 return DeclSyntax(transformedActor)
+             }
+            // (Logic for checking/updating subsystem is identical to ClassDecl)
+            var subsystemArgExists = false
+            var needsModification = false
+            var updatedArgs = callExpr.arguments
+
+            for (argIndex, arg) in callExpr.arguments.enumerated() {
+                if arg.label?.text == "subsystem" {
+                    subsystemArgExists = true
+                    if arg.expression.description != "\"\(moduleName)\"" {
+                         needsModification = true
+                         let newExpr = StringLiteralExprSyntax(content: moduleName)
+                         let updatedArg = arg.with(\.expression, ExprSyntax(newExpr))
+                         let listIndex = updatedArgs.index(updatedArgs.startIndex, offsetBy: argIndex)
+                         updatedArgs[listIndex] = updatedArg
+                    }
+                    break
+                }
+            }
+
+            if !subsystemArgExists {
+                var subsystemExpr = LabeledExprSyntax(label: "subsystem", colon: .colonToken(trailingTrivia: .space), expression: ExprSyntax(StringLiteralExprSyntax(content: moduleName)))
+                if !updatedArgs.isEmpty { subsystemExpr = subsystemExpr.with(\.trailingComma, .commaToken(trailingTrivia: .space)) }
+                updatedArgs.insert(subsystemExpr, at: updatedArgs.startIndex)
+                needsModification = true
+            }
+
+            if needsModification {
+                 let newCallExpr = callExpr.with(\.arguments, updatedArgs)
+                 let newInitializer = initializer.with(\.value, ExprSyntax(newCallExpr))
+                 let newBinding = binding.with(\.initializer, newInitializer)
+                 let newLoggerDecl = existingLoggerDecl.with(\.bindings, [newBinding])
+
+                 let memberIndex = updatedMembers.index(updatedMembers.startIndex, offsetBy: index)
+                 updatedMembers[memberIndex] = MemberBlockItemSyntax(decl: DeclSyntax(newLoggerDecl))
+
+                 let newMemberBlock = MemberBlockSyntax(members: updatedMembers)
+                 let updatedActor = transformedActor.with(\.memberBlock, newMemberBlock)
+                 self.currentTypeName = nil
+                 self.currentTypeKind = nil
+                 return DeclSyntax(updatedActor)
+             } else {
+                 self.currentTypeName = nil
+                 self.currentTypeKind = nil
+                 return DeclSyntax(transformedActor)
+             }
+        } else {
+            // Insert new logger: internal let logger = ...
+            let loggerDeclCode = "internal let logger = Logger(subsystem: \"\(moduleName)\", category: \"\(typeName)\")"
+            let loggerMember: MemberBlockItemSyntax
+            do {
+                guard let stmt = try? Parser.parse(source: loggerDeclCode).statements.first,
+                      let varDecl = stmt.item.as(VariableDeclSyntax.self) else {
+                    fputs("Error parsing logger variable declaration for actor \(typeName)\\n", stderr)
+                    self.currentTypeName = nil
+                    self.currentTypeKind = nil
+                    return DeclSyntax(transformedActor)
+                }
+                loggerMember = MemberBlockItemSyntax(decl: varDecl)
+            }
+            // (Logic for determining insertion index and trivia is identical to ClassDecl)
+             var indentTrivia: Trivia = .spaces(4)
+             let insertionIndex = firstNonVarDeclIndex ?? updatedMembers.count
+             if insertionIndex > 0, let previousMember = updatedMembers.dropLast(updatedMembers.count - insertionIndex).last { indentTrivia = previousMember.leadingTrivia.indentation(isOnNewline: true) ?? .spaces(0) }
+             else if let firstMember = updatedMembers.first { indentTrivia = firstMember.leadingTrivia.indentation(isOnNewline: true) ?? .spaces(0) }
+             var precedingMembersAreSpacedOut = false
+             if insertionIndex > 1 { for i in 1..<insertionIndex { let idx = updatedMembers.index(updatedMembers.startIndex, offsetBy: i); if updatedMembers[idx].leadingTrivia.containsNewlines(count: 2) { precedingMembersAreSpacedOut = true; break } } }
+             var loggerDeclWithTrivia = loggerMember
+             var newlinesBeforeLogger = 1
+             if precedingMembersAreSpacedOut { newlinesBeforeLogger = 2 }
+             else if insertionIndex > 0 { let previousMemberIndex = updatedMembers.index(updatedMembers.startIndex, offsetBy: insertionIndex - 1); if !updatedMembers[previousMemberIndex].decl.is(VariableDeclSyntax.self) { newlinesBeforeLogger = 2 } }
+             loggerDeclWithTrivia.leadingTrivia = .newlines(newlinesBeforeLogger) + indentTrivia
+             loggerDeclWithTrivia.trailingTrivia = Trivia()
+             updatedMembers.insert(loggerDeclWithTrivia, at: updatedMembers.index(updatedMembers.startIndex, offsetBy: insertionIndex))
+             let nextMemberRealIndex = insertionIndex + 1
+             if nextMemberRealIndex < updatedMembers.count {
+                 let nextMemberIndex = updatedMembers.index(updatedMembers.startIndex, offsetBy: nextMemberRealIndex)
+                 var nextMember = updatedMembers[nextMemberIndex]
+                 // Adjust for enum cases when determining spacing
+                 let requiredNewlines = (nextMember.decl.is(VariableDeclSyntax.self) || nextMember.decl.is(EnumCaseDeclSyntax.self)) ? 1 : 2
+                 // Adjust trivia of next element ONLY IF it exists
+                 if let nextElementIndent = nextMember.leadingTrivia.indentation(isOnNewline: true) {
+                    let newLeadingTrivia = .newlines(requiredNewlines) + nextElementIndent
+                    var mutableNextMember = nextMember
+                    mutableNextMember.leadingTrivia = newLeadingTrivia
+                    updatedMembers[nextMemberIndex] = mutableNextMember
+                }
+             }
+
+            let newMemberBlock = transformedActor.memberBlock.with(\.members, updatedMembers)
+            let updatedActor = transformedActor.with(\.memberBlock, newMemberBlock)
+            self.currentTypeName = nil
+            self.currentTypeKind = nil
+            return DeclSyntax(updatedActor)
         }
     }
 
     override func visit(_ node: StructDeclSyntax) -> DeclSyntax {
         self.currentTypeName = node.name.text
+        self.currentTypeKind = node.kind // Track kind
         guard let transformedStruct = super.visit(node).as(StructDeclSyntax.self) else {
+             // Clear context before returning
+            self.currentTypeName = nil
+            self.currentTypeKind = nil
             return DeclSyntax(node)
         }
 
@@ -528,7 +725,8 @@ class PrintToLoggerRewriter: SyntaxRewriter {
                    decl.is(ClassDeclSyntax.self) || 
                    decl.is(StructDeclSyntax.self) || 
                    decl.is(EnumDeclSyntax.self) ||
-                   decl.is(TypeAliasDeclSyntax.self) {
+                   decl.is(TypeAliasDeclSyntax.self) || // Added Actor
+                   decl.is(ActorDeclSyntax.self) {      // Added Actor
                     firstNonVarDeclIndex = index
                 }
             }
@@ -539,15 +737,17 @@ class PrintToLoggerRewriter: SyntaxRewriter {
         let typeName = transformedStruct.name.text
 
         if let existingLoggerDecl = loggerVarDecl, let index = loggerMemberIndex {
-            // Logger exists, modify it if needed
-            guard var binding = existingLoggerDecl.bindings.first, // Assume single binding logger = ...
-                  let initializer = binding.initializer, 
+            // Logger exists, modify ONLY subsystem if needed
+            // DO NOT change protection level or add/remove static here
+            guard var binding = existingLoggerDecl.bindings.first,
+                  let initializer = binding.initializer,
                   var callExpr = initializer.value.as(FunctionCallExprSyntax.self) else {
                 // Malformed logger declaration, skip modification
-                self.currentTypeName = nil 
+                self.currentTypeName = nil
+                self.currentTypeKind = nil
                 return DeclSyntax(transformedStruct) // Return unchanged
             }
-
+            // (Logic for checking/updating subsystem is identical to ClassDecl)
             var subsystemArgExists = false
             var needsModification = false
             var updatedArgs = callExpr.arguments
@@ -555,167 +755,262 @@ class PrintToLoggerRewriter: SyntaxRewriter {
             for (argIndex, arg) in callExpr.arguments.enumerated() {
                 if arg.label?.text == "subsystem" {
                     subsystemArgExists = true
-                    // Check if the value needs updating - safer comparison
-                    if let stringLiteral = arg.expression.as(StringLiteralExprSyntax.self) {
-                        if stringLiteral.segments.description != moduleName {
-                            needsModification = true
-                        }
-                    } else {
-                        needsModification = true 
+                    if arg.expression.description != "\"\(moduleName)\"" {
+                         needsModification = true
+                         let newExpr = StringLiteralExprSyntax(content: moduleName)
+                         let updatedArg = arg.with(\.expression, ExprSyntax(newExpr))
+                         let listIndex = updatedArgs.index(updatedArgs.startIndex, offsetBy: argIndex)
+                         updatedArgs[listIndex] = updatedArg
                     }
-                    
-                    if needsModification {
-                        let newExpr = StringLiteralExprSyntax(content: moduleName)
-                         // Use the correct keypath for the LabeledExprSyntax
-                        let updatedArg = arg.with(\.expression, ExprSyntax(newExpr))
-                        let listIndex = updatedArgs.index(updatedArgs.startIndex, offsetBy: argIndex)
-                        updatedArgs[listIndex] = updatedArg // Directly update the mutable list
-                    }
-                    break // Found subsystem, no need to check further args
+                    break
                 }
             }
 
             if !subsystemArgExists {
-                // Add the subsystem argument
-                let subsystemExpr = LabeledExprSyntax(label: "subsystem",
-                                                      colon: .colonToken(trailingTrivia: .space),
-                                                      expression: ExprSyntax(StringLiteralExprSyntax(content: moduleName)))
-                // Append the new argument, ensuring correct trivia if list wasn't empty
-                 if updatedArgs.isEmpty {
-                    updatedArgs.append(subsystemExpr)
-                } else {
-                    // Add comma and space to previous last argument's trailing trivia
-                    if var lastArg = updatedArgs.last, let lastIndex = updatedArgs.indices.last {
-                       let commaToken = TokenSyntax.commaToken(trailingTrivia: .space)
-                       lastArg = lastArg.with(\.trailingComma, commaToken)
-                       updatedArgs[lastIndex] = lastArg
-                    }
-                    updatedArgs.append(subsystemExpr)
-                }
+                var subsystemExpr = LabeledExprSyntax(label: "subsystem", colon: .colonToken(trailingTrivia: .space), expression: ExprSyntax(StringLiteralExprSyntax(content: moduleName)))
+                if !updatedArgs.isEmpty { subsystemExpr = subsystemExpr.with(\.trailingComma, .commaToken(trailingTrivia: .space)) }
+                updatedArgs.insert(subsystemExpr, at: updatedArgs.startIndex)
                 needsModification = true
             }
 
             if needsModification {
-                // Reconstruct the FunctionCallExprSyntax with the updated arguments
-                let newCallExpr = FunctionCallExprSyntax(
-                    calledExpression: callExpr.calledExpression,
-                    leftParen: callExpr.leftParen,
-                    arguments: updatedArgs, // Use the modified list
-                    rightParen: callExpr.rightParen,
-                    trailingClosure: callExpr.trailingClosure,
-                    additionalTrailingClosures: callExpr.additionalTrailingClosures
-                )
-                
-                // Reconstruct the InitializerClauseSyntax
-                let equalToken = initializer.equal.with(\.leadingTrivia, .space).with(\.trailingTrivia, Trivia())
-                let newInitializer = InitializerClauseSyntax(equal: equalToken, value: ExprSyntax(newCallExpr))
+                 let newCallExpr = callExpr.with(\.arguments, updatedArgs)
+                 let newInitializer = initializer.with(\.value, ExprSyntax(newCallExpr))
+                 let newBinding = binding.with(\.initializer, newInitializer)
+                 // Preserve existing modifiers (static, protection level)
+                 let newLoggerDecl = existingLoggerDecl.with(\.bindings, [newBinding])
 
-                // Reconstruct the PatternBindingSyntax
-                let patternWithoutTrivia = binding.pattern.with(\.trailingTrivia, Trivia())
-                let newBinding = PatternBindingSyntax(
-                    pattern: patternWithoutTrivia,
-                    typeAnnotation: binding.typeAnnotation,
-                    initializer: newInitializer,
-                    accessorBlock: binding.accessorBlock,
-                    trailingComma: binding.trailingComma
-                )
+                 let memberIndex = updatedMembers.index(updatedMembers.startIndex, offsetBy: index)
+                 updatedMembers[memberIndex] = MemberBlockItemSyntax(decl: DeclSyntax(newLoggerDecl))
 
-                // Reconstruct the VariableDeclSyntax (no private for structs)
-                let newLoggerDecl = VariableDeclSyntax(
-                    attributes: existingLoggerDecl.attributes,
-                    modifiers: existingLoggerDecl.modifiers,
-                    bindingSpecifier: existingLoggerDecl.bindingSpecifier
-                ) { 
-                    newBinding // Use the new binding
-                }
-
-                // Replace the old member in the list
-                let memberIndex = updatedMembers.index(updatedMembers.startIndex, offsetBy: index)
-                updatedMembers[memberIndex] = MemberBlockItemSyntax(decl: DeclSyntax(newLoggerDecl))
-                
-                // Reconstruct MemberBlock and StructDecl
                  let newMemberBlock = MemberBlockSyntax(members: updatedMembers)
                  let updatedStruct = transformedStruct.with(\.memberBlock, newMemberBlock)
                  self.currentTypeName = nil
-                return DeclSyntax(updatedStruct)
-            } else {
+                 self.currentTypeKind = nil
+                 return DeclSyntax(updatedStruct)
+             } else {
                  // Logger exists and is correct, return unchanged
-                self.currentTypeName = nil
-                return DeclSyntax(transformedStruct)
-            }
+                 self.currentTypeName = nil
+                 self.currentTypeKind = nil
+                 return DeclSyntax(transformedStruct)
+             }
 
         } else {
-            // Logger does not exist, insert a new one
-            // Structs get non-private logger
-            let loggerDeclCode = "let logger = Logger(subsystem: \"\(moduleName)\", category: \"\(typeName)\")"
+            // Logger does not exist, insert a new one: internal static let logger = ...
+            let loggerDeclCode = "internal static let logger = Logger(subsystem: \"\(moduleName)\", category: \"\(typeName)\")"
             let loggerMember: MemberBlockItemSyntax
             do {
                 guard let stmt = try? Parser.parse(source: loggerDeclCode).statements.first,
                       let varDecl = stmt.item.as(VariableDeclSyntax.self) else {
-                    fputs("Error parsing logger variable declaration for \(typeName)\n", stderr)
+                    fputs("Error parsing logger variable declaration for struct \(typeName)\\n", stderr)
                     self.currentTypeName = nil
+                    self.currentTypeKind = nil
                     return DeclSyntax(transformedStruct) // Return unchanged on error
                 }
                 loggerMember = MemberBlockItemSyntax(decl: varDecl)
             }
 
-            // Determine insertion index and trivia (existing logic)
+             // Determine insertion index and trivia (existing logic remains the same)
             var indentTrivia: Trivia = .spaces(4) // Default indent
             let insertionIndex = firstNonVarDeclIndex ?? updatedMembers.count
-
-            // Determine indent based on the member *before* the insertion point...
-            if insertionIndex > 0, let previousMember = updatedMembers.dropLast(updatedMembers.count - insertionIndex).last {
-                 indentTrivia = previousMember.leadingTrivia.indentation(isOnNewline: true) ?? .spaces(0)
-            } else if let firstMember = updatedMembers.first {
-                 indentTrivia = firstMember.leadingTrivia.indentation(isOnNewline: true) ?? .spaces(0)
-            }
-            
-            // Check if preceding members have blank lines...
-             var precedingMembersAreSpacedOut = false
-            if insertionIndex > 1 { 
-                for i in 1..<insertionIndex {
-                    let idx = updatedMembers.index(updatedMembers.startIndex, offsetBy: i)
-                    if updatedMembers[idx].leadingTrivia.containsNewlines(count: 2) {
-                        precedingMembersAreSpacedOut = true
-                        break
-                    }
-                }
-            }
-
-            // Prepare the logger declaration with appropriate trivia
+            if insertionIndex > 0, let previousMember = updatedMembers.dropLast(updatedMembers.count - insertionIndex).last { indentTrivia = previousMember.leadingTrivia.indentation(isOnNewline: true) ?? .spaces(0) }
+            else if let firstMember = updatedMembers.first { indentTrivia = firstMember.leadingTrivia.indentation(isOnNewline: true) ?? .spaces(0) }
+            var precedingMembersAreSpacedOut = false
+            if insertionIndex > 1 { for i in 1..<insertionIndex { let idx = updatedMembers.index(updatedMembers.startIndex, offsetBy: i); if updatedMembers[idx].leadingTrivia.containsNewlines(count: 2) { precedingMembersAreSpacedOut = true; break } } }
             var loggerDeclWithTrivia = loggerMember
             var newlinesBeforeLogger = 1
-            if precedingMembersAreSpacedOut {
-                newlinesBeforeLogger = 2
-            } else if insertionIndex > 0 {
-                let previousMemberIndex = updatedMembers.index(updatedMembers.startIndex, offsetBy: insertionIndex - 1)
-                if !updatedMembers[previousMemberIndex].decl.is(VariableDeclSyntax.self) {
-                     newlinesBeforeLogger = 2
-                }
-            }
-            
+            if precedingMembersAreSpacedOut { newlinesBeforeLogger = 2 }
+            else if insertionIndex > 0 { let previousMemberIndex = updatedMembers.index(updatedMembers.startIndex, offsetBy: insertionIndex - 1); if !updatedMembers[previousMemberIndex].decl.is(VariableDeclSyntax.self) && !updatedMembers[previousMemberIndex].decl.is(EnumCaseDeclSyntax.self) { newlinesBeforeLogger = 2 } } // Adjust for enum cases
             loggerDeclWithTrivia.leadingTrivia = .newlines(newlinesBeforeLogger) + indentTrivia
             loggerDeclWithTrivia.trailingTrivia = Trivia()
-
-            // Insert the logger
             updatedMembers.insert(loggerDeclWithTrivia, at: updatedMembers.index(updatedMembers.startIndex, offsetBy: insertionIndex))
-
-            // Adjust the NEXT member's leading trivia...
             let nextMemberRealIndex = insertionIndex + 1
             if nextMemberRealIndex < updatedMembers.count {
                 let nextMemberIndex = updatedMembers.index(updatedMembers.startIndex, offsetBy: nextMemberRealIndex)
                 var nextMember = updatedMembers[nextMemberIndex]
-                let requiredNewlines = nextMember.decl.is(VariableDeclSyntax.self) ? 1 : 2
-                let newLeadingTrivia = .newlines(requiredNewlines) + indentTrivia
-                var mutableNextMember = nextMember
-                mutableNextMember.leadingTrivia = newLeadingTrivia
-                updatedMembers[nextMemberIndex] = mutableNextMember
+                // Adjust for enum cases when determining spacing
+                // Need 1 newline if the next member IS a var or enum case, 2 otherwise
+                let requiredNewlines = (nextMember.decl.is(VariableDeclSyntax.self) || nextMember.decl.is(EnumCaseDeclSyntax.self)) ? 1 : 2
+                // Adjust trivia of next element ONLY IF it exists
+                if let nextElementIndent = nextMember.leadingTrivia.indentation(isOnNewline: true) {
+                    let newLeadingTrivia = .newlines(requiredNewlines) + nextElementIndent
+                    var mutableNextMember = nextMember
+                    mutableNextMember.leadingTrivia = newLeadingTrivia
+                    updatedMembers[nextMemberIndex] = mutableNextMember
+                }
             }
 
             let newMemberBlock = transformedStruct.memberBlock.with(\.members, updatedMembers)
             let updatedStruct = transformedStruct.with(\.memberBlock, newMemberBlock)
             self.currentTypeName = nil
+            self.currentTypeKind = nil
             return DeclSyntax(updatedStruct)
+        }
+    }
+
+    // --- Add visit for EnumDeclSyntax ---
+     override func visit(_ node: EnumDeclSyntax) -> DeclSyntax {
+        self.currentTypeName = node.name.text
+        self.currentTypeKind = node.kind // Track kind
+        guard let transformedEnum = super.visit(node).as(EnumDeclSyntax.self) else {
+            // Clear context before returning
+            self.currentTypeName = nil
+            self.currentTypeKind = nil
+            return DeclSyntax(node)
+        }
+
+        var loggerVarDecl: VariableDeclSyntax? = nil
+        var loggerMemberIndex: Int? = nil
+        var firstNonVarDeclIndex: Int? = nil
+
+        for (index, member) in transformedEnum.memberBlock.members.enumerated() {
+            let decl = member.decl
+            if loggerVarDecl == nil, let varDecl = decl.as(VariableDeclSyntax.self) {
+                for binding in varDecl.bindings {
+                    if let pattern = binding.pattern.as(IdentifierPatternSyntax.self), pattern.identifier.text == "logger" {
+                        loggerVarDecl = varDecl
+                        loggerMemberIndex = index
+                    }
+                }
+            }
+             if firstNonVarDeclIndex == nil {
+                 if decl.is(FunctionDeclSyntax.self) || decl.is(InitializerDeclSyntax.self) ||
+                    decl.is(SubscriptDeclSyntax.self) || decl.is(ClassDeclSyntax.self) ||
+                    decl.is(StructDeclSyntax.self) || decl.is(EnumDeclSyntax.self) ||
+                    decl.is(TypeAliasDeclSyntax.self) || decl.is(ActorDeclSyntax.self) ||
+                    decl.is(EnumCaseDeclSyntax.self) { // Check for EnumCaseDeclSyntax here is correct for finding first *non* case/var/etc.
+                     firstNonVarDeclIndex = index
+                 }
+             }
+        }
+
+        var updatedMembers = transformedEnum.memberBlock.members
+        let typeName = transformedEnum.name.text
+
+        if let existingLoggerDecl = loggerVarDecl, let index = loggerMemberIndex {
+            // Logger exists, modify ONLY subsystem if needed
+            guard var binding = existingLoggerDecl.bindings.first,
+                  let initializer = binding.initializer,
+                  var callExpr = initializer.value.as(FunctionCallExprSyntax.self) else {
+                self.currentTypeName = nil
+                self.currentTypeKind = nil
+                return DeclSyntax(transformedEnum)
+            }
+            // (Logic for checking/updating subsystem is identical to ClassDecl/StructDecl)
+            var subsystemArgExists = false
+            var needsModification = false
+            var updatedArgs = callExpr.arguments
+
+            for (argIndex, arg) in callExpr.arguments.enumerated() {
+                if arg.label?.text == "subsystem" {
+                    subsystemArgExists = true
+                    if arg.expression.description != "\"\(moduleName)\"" {
+                         needsModification = true
+                         let newExpr = StringLiteralExprSyntax(content: moduleName)
+                         let updatedArg = arg.with(\.expression, ExprSyntax(newExpr))
+                         let listIndex = updatedArgs.index(updatedArgs.startIndex, offsetBy: argIndex)
+                         updatedArgs[listIndex] = updatedArg
+                    }
+                    break
+                }
+            }
+
+            if !subsystemArgExists {
+                var subsystemExpr = LabeledExprSyntax(label: "subsystem", colon: .colonToken(trailingTrivia: .space), expression: ExprSyntax(StringLiteralExprSyntax(content: moduleName)))
+                if !updatedArgs.isEmpty { subsystemExpr = subsystemExpr.with(\.trailingComma, .commaToken(trailingTrivia: .space)) }
+                updatedArgs.insert(subsystemExpr, at: updatedArgs.startIndex)
+                needsModification = true
+            }
+
+            if needsModification {
+                let newCallExpr = callExpr.with(\.arguments, updatedArgs)
+                let newInitializer = initializer.with(\.value, ExprSyntax(newCallExpr))
+                let newBinding = binding.with(\.initializer, newInitializer)
+                let newLoggerDecl = existingLoggerDecl.with(\.bindings, [newBinding]) // Preserve existing modifiers
+
+                let memberIndex = updatedMembers.index(updatedMembers.startIndex, offsetBy: index)
+                updatedMembers[memberIndex] = MemberBlockItemSyntax(decl: DeclSyntax(newLoggerDecl))
+
+                let newMemberBlock = MemberBlockSyntax(members: updatedMembers)
+                let updatedEnum = transformedEnum.with(\.memberBlock, newMemberBlock)
+                self.currentTypeName = nil
+                self.currentTypeKind = nil
+                return DeclSyntax(updatedEnum)
+            } else {
+                self.currentTypeName = nil
+                self.currentTypeKind = nil
+                return DeclSyntax(transformedEnum)
+            }
+        } else {
+            // Insert new logger: internal static let logger = ...
+            let loggerDeclCode = "internal static let logger = Logger(subsystem: \"\(moduleName)\", category: \"\(typeName)\")"
+            let loggerMember: MemberBlockItemSyntax
+            do {
+                guard let stmt = try? Parser.parse(source: loggerDeclCode).statements.first,
+                      let varDecl = stmt.item.as(VariableDeclSyntax.self) else {
+                    fputs("Error parsing logger variable declaration for enum \(typeName)\\n", stderr)
+                    self.currentTypeName = nil
+                    self.currentTypeKind = nil
+                    return DeclSyntax(transformedEnum)
+                }
+                loggerMember = MemberBlockItemSyntax(decl: varDecl)
+            }
+            // (Logic for determining insertion index and trivia is identical to StructDecl)
+             var indentTrivia: Trivia = .spaces(4)
+             let insertionIndex = firstNonVarDeclIndex ?? updatedMembers.count
+             if insertionIndex > 0, let previousMember = updatedMembers.dropLast(updatedMembers.count - insertionIndex).last { indentTrivia = previousMember.leadingTrivia.indentation(isOnNewline: true) ?? .spaces(0) }
+             else if let firstMember = updatedMembers.first { indentTrivia = firstMember.leadingTrivia.indentation(isOnNewline: true) ?? .spaces(0) }
+             var precedingMembersAreSpacedOut = false
+             if insertionIndex > 1 { for i in 1..<insertionIndex { let idx = updatedMembers.index(updatedMembers.startIndex, offsetBy: i); if updatedMembers[idx].leadingTrivia.containsNewlines(count: 2) { precedingMembersAreSpacedOut = true; break } } }
+             var loggerDeclWithTrivia = loggerMember
+             var newlinesBeforeLogger = 1
+             if precedingMembersAreSpacedOut { newlinesBeforeLogger = 2 }
+             else if insertionIndex > 0 {
+                 let previousMemberIndex = updatedMembers.index(updatedMembers.startIndex, offsetBy: insertionIndex - 1)
+                 let previousDecl = updatedMembers[previousMemberIndex].decl
+                 // Add 2 newlines if the previous wasn't a var or an enum case
+                 if !previousDecl.is(VariableDeclSyntax.self) && !previousDecl.is(EnumCaseDeclSyntax.self) {
+                     newlinesBeforeLogger = 2
+                 }
+             }
+             loggerDeclWithTrivia.leadingTrivia = .newlines(newlinesBeforeLogger) + indentTrivia
+             loggerDeclWithTrivia.trailingTrivia = Trivia()
+             updatedMembers.insert(loggerDeclWithTrivia, at: updatedMembers.index(updatedMembers.startIndex, offsetBy: insertionIndex))
+             let nextMemberRealIndex = insertionIndex + 1
+             if nextMemberRealIndex < updatedMembers.count {
+                 let nextMemberIndex = updatedMembers.index(updatedMembers.startIndex, offsetBy: nextMemberRealIndex)
+                 var nextMember = updatedMembers[nextMemberIndex]
+                 let nextDecl = nextMember.decl
+                 // Adjust for enum cases when determining spacing
+                 // Need 1 newline if the next member IS a var or enum case, 2 otherwise
+                 let requiredNewlines = (nextDecl.is(VariableDeclSyntax.self) || nextDecl.is(EnumCaseDeclSyntax.self)) ? 1 : 2
+                 // Adjust trivia of next element ONLY IF it exists
+                 if let nextElementIndent = nextMember.leadingTrivia.indentation(isOnNewline: true) {
+                    let newLeadingTrivia = .newlines(requiredNewlines) + nextElementIndent
+                    var mutableNextMember = nextMember
+                    mutableNextMember.leadingTrivia = newLeadingTrivia
+                    updatedMembers[nextMemberIndex] = mutableNextMember
+                }
+             }
+
+            let newMemberBlock = transformedEnum.memberBlock.with(\.members, updatedMembers)
+            let updatedEnum = transformedEnum.with(\.memberBlock, newMemberBlock)
+            self.currentTypeName = nil
+            self.currentTypeKind = nil
+            return DeclSyntax(updatedEnum)
+        }
+    }
+
+    // Clear context when leaving a type definition
+    override func visitPost(_ node: Syntax) {
+        if node.is(ClassDeclSyntax.self) || node.is(StructDeclSyntax.self) || node.is(EnumDeclSyntax.self) || node.is(ActorDeclSyntax.self) {
+             // Only clear if the current node matches the one we stored context for
+             if self.currentTypeName == (node.asProtocol(NamedDeclSyntax.self)?.name.text),
+                self.currentTypeKind == node.kind {
+                 self.currentTypeName = nil
+                 self.currentTypeKind = nil
+//                 print("Cleared context for \\(node.kind) \\(node.asProtocol(NamedDeclSyntax.self)?.name.text ?? "")") // DEBUG
+             }
         }
     }
 }
@@ -775,12 +1070,74 @@ while let fileURL = enumerator.nextObject() as? URL {
     if !hasImport {
         let importDecl: ImportDeclSyntax
         importDecl = try! ImportDeclSyntax("import os.log")
-
         var importItem = CodeBlockItemSyntax(item: .decl(DeclSyntax(importDecl)))
-        importItem = importItem.with(\.trailingTrivia, Trivia.newlines(1))
         
-        let newStatements = [importItem] + finalFile.statements
-        finalFile = finalFile.with(\.statements, newStatements)
+        var statements = finalFile.statements
+        var lastImportIndex: Int? = nil
+
+        // Find the index of the last import statement
+        for (index, stmt) in statements.enumerated().reversed() {
+            if stmt.item.is(ImportDeclSyntax.self) {
+                lastImportIndex = index
+                break
+            }
+        }
+
+        if let lastIndex = lastImportIndex {
+            // Insert after the last import
+            let targetIndex = statements.index(statements.startIndex, offsetBy: lastIndex)
+            var lastImportItem = statements[targetIndex]
+            
+            // Ensure the last import has one newline after it
+            if !lastImportItem.trailingTrivia.containsNewlines(count: 1) {
+                 lastImportItem.trailingTrivia = lastImportItem.trailingTrivia + .newlines(1)
+            } else {
+                // It already has at least one, ensure it's exactly one?
+                // Or just keep existing trivia? Keeping existing for now.
+            }
+            statements[targetIndex] = lastImportItem
+            
+            // Prepare the new import with indent (if possible), but no leading newline
+            let indentTrivia = (lastImportItem.leadingTrivia.indentation(isOnNewline: true) ?? Trivia()) // indentation can return nil
+            importItem.leadingTrivia = indentTrivia
+            // Add trailing newline to separate from next code block
+            importItem.trailingTrivia = .newlines(1) 
+
+            // Insert the new import item
+            statements.insert(importItem, at: statements.index(after: targetIndex))
+            
+            // Ensure the *next* code block starts after ONE newline from the imports
+            let nextCodeBlockIndex = statements.index(after: statements.index(after: targetIndex))
+            if nextCodeBlockIndex < statements.endIndex {
+                var nextBlock = statements[nextCodeBlockIndex]
+                // Adjust if it doesn't start with exactly one newline
+                if !(nextBlock.leadingTrivia.containsNewlines(count: 1) && !nextBlock.leadingTrivia.containsNewlines(count: 2)) {
+                    let indent = nextBlock.leadingTrivia.indentation(isOnNewline: true) ?? Trivia()
+                    // Remove extra newlines first, then add exactly one
+                    nextBlock.leadingTrivia = .newlines(1) + indent
+                    statements[nextCodeBlockIndex] = nextBlock
+                }
+            }
+            
+        } else {
+            // No existing imports, insert at the beginning
+             importItem = importItem.with(\.trailingTrivia, Trivia())
+            // Add potential leading trivia from the original first statement
+            if let firstStmt = statements.first {
+                 importItem.leadingTrivia = firstStmt.leadingTrivia.removingNewlinesBeforeFirstCommentOrCode()
+                 // Ensure ONE newline after the import before the original first statement
+                var mutableFirst = firstStmt
+                let indent = firstStmt.leadingTrivia.indentation(isOnNewline: true) ?? Trivia()
+                 mutableFirst.leadingTrivia = .newlines(1) + indent
+                statements[statements.startIndex] = mutableFirst
+            } else {
+                 // If the file was empty, just add ONE newline after import
+                 importItem.trailingTrivia = .newlines(1)
+            }
+            statements.insert(importItem, at: statements.startIndex)
+        }
+        
+        finalFile = finalFile.with(\.statements, statements)
     }
     
     if options.dryRun && modifiedCount >= 3 { break }
