@@ -132,18 +132,27 @@ class PrintToLoggerRewriter: SyntaxRewriter {
     var pendingFileLevelLoggers: [String: String] = [:] // Track loggers for generic types [TypeName: DeclString]
     // Add a set to track types that actually contain print calls
     var typesContainingPrint: Set<String> = []
+    // Add maps to store kind and genericity info for types encountered in the file
+    var typeKinds: [String: SyntaxKind] = [:] 
+    var typeIsGeneric: [String: Bool] = [: ]
 
     init(moduleName: String) {
         self.moduleName = moduleName
     }
 
     // Helper to find enclosing type and if inside a closure
+    // Returns:
+    // - typeName: Name of the direct enclosing type OR the extended type if inside an extension.
+    // - typeKind: Kind of the direct enclosing type (nil if inside extension or top-level).
+    // - isInClosure: Whether the node is inside a closure.
+    // - isGeneric: Whether the *direct* enclosing type is generic (true only if typeKind is non-nil and type is generic).
     private func findEnclosingContext(startNode: Syntax) -> (typeName: String?, typeKind: SyntaxKind?, isInClosure: Bool, isGeneric: Bool) {
         var current: Syntax? = startNode.parent
         var enclosingTypeName: String? = nil
         var enclosingTypeKind: SyntaxKind? = nil
         var isInClosure = false
         var isGeneric = false // Added to track genericity
+        var extensionTypeName: String? = nil // Track if inside an extension
 
         while let node = current {
             // Check for closures first
@@ -177,19 +186,30 @@ class PrintToLoggerRewriter: SyntaxRewriter {
                 }
             }
 
-            // If we've found the type AND determined if we are in a closure, we can potentially stop early,
+            // Check for extensions (prioritize this if found first)
+            if extensionTypeName == nil, let extensionDecl = node.as(ExtensionDeclSyntax.self) {
+                 // Use the extended type's name. Strip generic parameters for the name.
+                 extensionTypeName = extensionDecl.extendedType.trimmedDescription.split(separator: "<").first.map(String.init)
+                 // We don't necessarily know the kind or genericity from the extension decl alone.
+                 // Continue walking up to find closure context if needed.
+            }
+
+            // If we've found the type/extension AND determined if we are in a closure, we can potentially stop early,
             // but iterating all the way up is safer to catch all closure contexts.
             // if enclosingTypeName != nil && isInClosure { break }
 
             current = node.parent
         }
         // Return ONLY the directly found context from walking the tree.
-        return (typeName: enclosingTypeName, typeKind: enclosingTypeKind, isInClosure: isInClosure, isGeneric: isGeneric)
+        // Prioritize the extension type name if found. If inside an extension, typeKind and isGeneric are less relevant/accurate from this context alone.
+        let finalTypeName = extensionTypeName ?? enclosingTypeName
+        let finalTypeKind = extensionTypeName != nil ? nil : enclosingTypeKind // Kind only applies if not in extension context directly
+        let finalIsGeneric = extensionTypeName != nil ? false : isGeneric     // Genericity only applies if not in extension context directly
+        return (typeName: finalTypeName, typeKind: finalTypeKind, isInClosure: isInClosure, isGeneric: finalIsGeneric)
     }
 
     override func visit(_ node: FunctionCallExprSyntax) -> ExprSyntax {
-        guard let called = node.calledExpression.as(DeclReferenceExprSyntax.self),
-              called.baseName.text == "print" else {
+        guard node.calledExpression.trimmedDescription == "print" else {
             return super.visit(node)
         }
 
@@ -197,23 +217,12 @@ class PrintToLoggerRewriter: SyntaxRewriter {
 
         // Only replace print if we are reasonably sure a 'logger' is in scope
         // This now depends on the context (generic type -> file logger, non-generic -> member logger)
-        let enclosingTypeFound = context.typeKind != nil && context.typeName != nil
-        // Let's also check if the current node is actually *within* the body of the enclosing type
-        // (This helps filter out print calls in extensions defined in the same file but outside the primary type)
-        // This might be overly complex; let's rely on the logger injection logic for now.
-
-        // Record the type name if we are replacing a print call within a type context
-        if let typeName = context.typeName, enclosingTypeFound {
-            typesContainingPrint.insert(typeName)
-            // print(">>> Found print in \\(typeName)") // DEBUG
-        }
-
-        let isInsideTaskClosure = context.isInClosure // Re-evaluate if this is the best way to detect Task{}
-        // GUARD condition adjustment: Allow replacement if type context OR task closure detected,
-        // but the logger *injection* will depend on typesContainingPrint.
-        guard enclosingTypeFound || isInsideTaskClosure else {
+        // If context.typeName is non-nil, it means we found either a direct type OR an extension target.
+        let typeContextFound = context.typeName != nil
+        let isInsideTaskClosure = context.isInClosure
+        guard typeContextFound || isInsideTaskClosure else {
             // print("Skipping print replacement outside of a recognized type or Task/closure context.") // DEBUG
-            return super.visit(node) // Don't replace if not inside a processed type or detected closure
+            return super.visit(node) // Don't replace if not inside a recognized type/extension or detected closure
         }
 
         // If typeName wasn't found by walking up, but we are in a closure, we might need it for struct/enum prefix.
@@ -284,7 +293,7 @@ class PrintToLoggerRewriter: SyntaxRewriter {
                         var needsSelfPrefix = false // Default: No prefix
 
                         // Condition 1: Are we in a context where 'self.' might be needed? (Class/Actor, non-generic)
-                        let selfPrefixPotentiallyNeeded = !context.isGeneric && (context.typeKind == .classDecl || context.typeKind == .actorDecl)
+                        let selfPrefixPotentiallyNeeded = context.typeKind != nil && !context.isGeneric && (context.typeKind == .classDecl || context.typeKind == .actorDecl)
 
                         if selfPrefixPotentiallyNeeded {
                             // Condition 2: Is the expression potentially referring to an instance member?
@@ -545,7 +554,7 @@ class PrintToLoggerRewriter: SyntaxRewriter {
                  var needsSelfPrefix = false // Default: No prefix
 
                  // Condition 1: Are we in a context where 'self.' might be needed? (Class/Actor, non-generic)
-                 let selfPrefixPotentiallyNeeded = !context.isGeneric && (context.typeKind == .classDecl || context.typeKind == .actorDecl)
+                 let selfPrefixPotentiallyNeeded = context.typeKind != nil && !context.isGeneric && (context.typeKind == .classDecl || context.typeKind == .actorDecl)
 
                  if selfPrefixPotentiallyNeeded {
                      // Condition 2: Is the expression potentially referring to an instance member?
@@ -798,12 +807,19 @@ class PrintToLoggerRewriter: SyntaxRewriter {
         var loggerNameToUse: String
         var loggerCallPrefix = "" // e.g., self. or TypeName.
 
-        if context.isGeneric {
-             loggerNameToUse = (context.typeName ?? "unknownType") + "Logger" // e.g., MyGenericStructLogger
-             loggerCallPrefix = "" // File-level access, no prefix
-        } else {
-             loggerNameToUse = "logger" // Standard name for non-generic
-             switch context.typeKind {
+        // --- Determine logger name and prefix based on looked-up kind and genericity --- //
+        let actualKind = context.typeName.flatMap { self.typeKinds[$0] }
+        let isActuallyGeneric = context.typeName.flatMap { self.typeIsGeneric[$0] } ?? false
+
+        if isActuallyGeneric && (actualKind == .structDecl || actualKind == .enumDecl) {
+             // Generic struct/enum -> Use file-level logger
+              loggerNameToUse = (context.typeName ?? "unknownType") + "Logger"
+              loggerCallPrefix = "" // File-level access, no prefix
+         } else {
+             // Non-generic type OR class/actor (generic or not)
+              loggerNameToUse = "logger" // Standard name for non-generic or instance loggers
+
+             switch actualKind { // Use the looked-up kind
              case .structDecl, .enumDecl:
                  // Static logger access: TypeName.logger
                  if let name = context.typeName { // Use the directly found type name
@@ -813,30 +829,28 @@ class PrintToLoggerRewriter: SyntaxRewriter {
                  }
              case .classDecl, .actorDecl:
                  // Instance logger access: self.logger or logger
-                  if context.isInClosure || isInsideTaskClosure {
-                      loggerCallPrefix = "self."
-                  } else {
-                      loggerCallPrefix = "" // Implicit self
-                  }
+                 if context.isInClosure { // Don't rely on isInsideTaskClosure here, just isInClosure from context
+                     loggerCallPrefix = "self."
+                 } else {
+                     loggerCallPrefix = "" // Implicit self
+                 }
              default:
-                 // Global context or Task block potentially outside known type
-                  if isInsideTaskClosure { // Assumed to be in a class/actor context if in Task
-                      loggerCallPrefix = "self."
-                       loggerNameToUse = "logger" // Assume standard name exists via self
-                  } else {
-                      // Cannot determine prefix or logger name reliably
-                      loggerCallPrefix = ""
-                      loggerNameToUse = "logger" // Best guess
+                 // Global context or Task block potentially outside known type, or kind unknown
+                 if context.isInClosure { // Fallback: Assume class/actor context if in closure but kind unknown
+                     loggerCallPrefix = "self."
+                     loggerNameToUse = "logger" // Assume standard name exists via self
+                 } else {
+                     // Cannot determine prefix or logger name reliably
+                     loggerCallPrefix = ""
+                     loggerNameToUse = "logger" // Best guess
                  }
              }
-        }
+         }
 
         // Use the determined log level directly as the method name.
         let loggerMethod = logLevel
         // Ensure prefix ends with "." if it's not empty and requires it
-        if !loggerCallPrefix.isEmpty && !loggerCallPrefix.hasSuffix(".") {
-             loggerCallPrefix += "." // Should only happen for TypeName.
-        }
+        // The logic above now correctly adds the dot for TypeName.
         let loggerCallCode = "\(loggerCallPrefix)\(loggerNameToUse).\(loggerMethod)(\(logMessageCode))"
 
         var newCallExpr: ExprSyntax = ExprSyntax("\(raw: loggerCallCode)")
@@ -873,6 +887,21 @@ class PrintToLoggerRewriter: SyntaxRewriter {
         // Reset generic flag for classes/actors.
         self.isCurrentTypeGeneric = false
         let typeName = node.name.text // Store before super.visit might clear
+        self.typeKinds[typeName] = node.kind // Store kind
+        self.typeIsGeneric[typeName] = false // Classes are instance-based, treat as non-generic for logger access
+
+        // --- Pre-check for print statements in class or its extensions --- //
+        var shouldInsertLogger = node.description.contains("print(")
+        if !shouldInsertLogger, let sourceFile = node.root.as(SourceFileSyntax.self) {
+            for stmt in sourceFile.statements {
+                if let extDecl = stmt.item.as(ExtensionDeclSyntax.self),
+                   extDecl.extendedType.trimmedDescription.split(separator: "<").first.map(String.init) == typeName,
+                   extDecl.description.contains("print(") {
+                    shouldInsertLogger = true
+                    break
+                }
+            }
+        }
 
         guard let transformedClass = super.visit(node).as(ClassDeclSyntax.self) else {
             // Clear context before returning
@@ -921,8 +950,8 @@ class PrintToLoggerRewriter: SyntaxRewriter {
         var updatedMembers = transformedClass.memberBlock.members
         // let typeName = transformedClass.name.text // Moved up
 
-        // Check if this type actually contained print statements
-        let hasPrintStatements = typesContainingPrint.contains(typeName)
+        // Use the pre-calculated flag based on prints in the class or its extensions
+        // let hasPrintStatements = typesContainingPrint.contains(typeName) // Replaced
 
         if let existingLoggerDecl = loggerVarDecl, let index = loggerMemberIndex {
             // Logger exists, modify it if needed (ONLY subsystem) - ALWAYS do this
@@ -990,7 +1019,7 @@ class PrintToLoggerRewriter: SyntaxRewriter {
                 return DeclSyntax(transformedClass)
             }
 
-        } else if hasPrintStatements { // ONLY insert if the type had print statements
+        } else if shouldInsertLogger { // ONLY insert if the type or its extensions had print statements
             // Logger does not exist, insert a new one: internal let logger = ...
             let loggerDeclCode = "internal let logger = Logger(subsystem: \"\(moduleName)\", category: \"\(typeName)\")"
             let loggerMember: MemberBlockItemSyntax
@@ -1081,6 +1110,21 @@ class PrintToLoggerRewriter: SyntaxRewriter {
         // Actors can be generic, but like classes, use instance logger.
         self.isCurrentTypeGeneric = false
         let typeName = node.name.text // Store before super.visit
+        self.typeKinds[typeName] = node.kind // Store kind
+        self.typeIsGeneric[typeName] = false // Actors are instance-based, treat as non-generic for logger access
+
+        // --- Pre-check for print statements in actor or its extensions --- //
+        var shouldInsertLogger = node.description.contains("print(")
+        if !shouldInsertLogger, let sourceFile = node.root.as(SourceFileSyntax.self) {
+            for stmt in sourceFile.statements {
+                if let extDecl = stmt.item.as(ExtensionDeclSyntax.self),
+                   extDecl.extendedType.trimmedDescription.split(separator: "<").first.map(String.init) == typeName,
+                   extDecl.description.contains("print(") {
+                    shouldInsertLogger = true
+                    break
+                }
+            }
+        }
 
         guard let transformedActor = super.visit(node).as(ActorDeclSyntax.self) else {
             // Clear context before returning
@@ -1117,8 +1161,8 @@ class PrintToLoggerRewriter: SyntaxRewriter {
         var updatedMembers = transformedActor.memberBlock.members
         // let typeName = transformedActor.name.text // Moved up
 
-        // Check if this type actually contained print statements
-        let hasPrintStatements = typesContainingPrint.contains(typeName)
+        // Use the pre-calculated flag based on prints in the actor or its extensions
+        // let hasPrintStatements = typesContainingPrint.contains(typeName) // Replaced
 
         if let existingLoggerDecl = loggerVarDecl, let index = loggerMemberIndex {
             // Logger exists, modify ONLY subsystem if needed - ALWAYS do this
@@ -1177,7 +1221,7 @@ class PrintToLoggerRewriter: SyntaxRewriter {
                  self.isCurrentTypeGeneric = false // Reset on exit
                  return DeclSyntax(transformedActor)
              }
-        } else if hasPrintStatements { // ONLY insert if the type had print statements
+        } else if shouldInsertLogger { // ONLY insert if the type or its extensions had print statements
             // Insert new logger: internal let logger = ...
             let loggerDeclCode = "internal let logger = Logger(subsystem: \"\(moduleName)\", category: \"\(typeName)\")"
             let loggerMember: MemberBlockItemSyntax
@@ -1245,6 +1289,21 @@ class PrintToLoggerRewriter: SyntaxRewriter {
         let isGeneric = node.genericParameterClause != nil
         self.isCurrentTypeGeneric = isGeneric // Set context for children
         let typeName = node.name.text // Store before super.visit clears context
+        self.typeKinds[typeName] = node.kind // Store kind
+        self.typeIsGeneric[typeName] = isGeneric // Store genericity
+
+        // --- Pre-check for print statements in struct or its extensions --- //
+        var shouldAddLoggerForPrint = node.description.contains("print(")
+        if !shouldAddLoggerForPrint, let sourceFile = node.root.as(SourceFileSyntax.self) {
+            for stmt in sourceFile.statements {
+                if let extDecl = stmt.item.as(ExtensionDeclSyntax.self),
+                   extDecl.extendedType.trimmedDescription.split(separator: "<").first.map(String.init) == typeName,
+                   extDecl.description.contains("print(") {
+                    shouldAddLoggerForPrint = true
+                    break
+                }
+            }
+        }
 
         // Perform super.visit FIRST to handle nested types correctly
         guard let transformedStruct = super.visit(node).as(StructDeclSyntax.self) else {
@@ -1296,11 +1355,11 @@ class PrintToLoggerRewriter: SyntaxRewriter {
         // --- Modify Existing Logger OR Insert New One ---
         // let typeName = transformedStruct.name.text // Moved up
 
-        // Check if this type actually contained print statements
-        let hasPrintStatements = typesContainingPrint.contains(typeName)
+        // Use the pre-calculated flag
+        // let hasPrintStatements = typesContainingPrint.contains(typeName) // Replaced
 
         // If the struct is generic AND had print statements, queue file-level logger and REMOVE internal one
-        if isGeneric && hasPrintStatements {
+        if isGeneric && shouldAddLoggerForPrint {
             let loggerDeclCode = "fileprivate let \(typeName)Logger = Logger(subsystem: \"\(moduleName)\", category: \"\(typeName)\")"
             pendingFileLevelLoggers[typeName] = loggerDeclCode
             // print(">>> Queued file logger for generic struct \\(typeName)") // DEBUG
@@ -1388,7 +1447,7 @@ class PrintToLoggerRewriter: SyntaxRewriter {
                  return DeclSyntax(transformedStruct)
              }
 
-        } else if !isGeneric && hasPrintStatements { // ONLY insert if non-generic AND had print
+        } else if !isGeneric && shouldAddLoggerForPrint { // ONLY insert if non-generic AND had print (check flag)
             // Logger does not exist, insert a new one: internal static let logger = ...
             let loggerDeclCode = "internal static let logger = Logger(subsystem: \"\(moduleName)\", category: \"\(typeName)\")"
             let loggerMember: MemberBlockItemSyntax
@@ -1458,6 +1517,21 @@ class PrintToLoggerRewriter: SyntaxRewriter {
         let isGeneric = node.genericParameterClause != nil
         self.isCurrentTypeGeneric = isGeneric // Set context for children
         let typeName = node.name.text // Store before super.visit
+        self.typeKinds[typeName] = node.kind // Store kind
+        self.typeIsGeneric[typeName] = isGeneric // Store genericity
+
+        // --- Pre-check for print statements in enum or its extensions --- //
+        var shouldAddLoggerForPrint = node.description.contains("print(")
+        if !shouldAddLoggerForPrint, let sourceFile = node.root.as(SourceFileSyntax.self) {
+            for stmt in sourceFile.statements {
+                if let extDecl = stmt.item.as(ExtensionDeclSyntax.self),
+                   extDecl.extendedType.trimmedDescription.split(separator: "<").first.map(String.init) == typeName,
+                   extDecl.description.contains("print(") {
+                    shouldAddLoggerForPrint = true
+                    break
+                }
+            }
+        }
 
         // Perform super.visit FIRST to handle nested types correctly
         guard let transformedEnum = super.visit(node).as(EnumDeclSyntax.self) else {
@@ -1498,11 +1572,11 @@ class PrintToLoggerRewriter: SyntaxRewriter {
 
         // let typeName = transformedEnum.name.text // Moved up
 
-        // Check if this type actually contained print statements
-        let hasPrintStatements = typesContainingPrint.contains(typeName)
+        // Use the pre-calculated flag
+        // let hasPrintStatements = typesContainingPrint.contains(typeName) // Replaced
 
         // If the enum is generic AND had print statements, queue file-level logger and REMOVE internal one
-        if isGeneric && hasPrintStatements {
+        if isGeneric && shouldAddLoggerForPrint {
             let loggerDeclCode = "fileprivate let \(typeName)Logger = Logger(subsystem: \"\(moduleName)\", category: \"\(typeName)\")"
             pendingFileLevelLoggers[typeName] = loggerDeclCode
              // print(">>> Queued file logger for generic enum \\(typeName)") // DEBUG
@@ -1585,7 +1659,7 @@ class PrintToLoggerRewriter: SyntaxRewriter {
                 self.isCurrentTypeGeneric = false // Reset on exit
                 return DeclSyntax(transformedEnum)
             }
-        } else if !isGeneric && hasPrintStatements { // ONLY insert if non-generic AND had print
+        } else if !isGeneric && shouldAddLoggerForPrint { // ONLY insert if non-generic AND had print (check flag)
             // Insert new logger: internal static let logger = ...
             let loggerDeclCode = "internal static let logger = Logger(subsystem: \"\(moduleName)\", category: \"\(typeName)\")"
             let loggerMember: MemberBlockItemSyntax
@@ -1721,183 +1795,116 @@ while let fileURL = enumerator.nextObject() as? URL {
     }
      // Only print if likely to be modified
     
-    // Clear the print tracking set for each new file
+    // Reset maps for the new file
+    rewriter.typeKinds.removeAll()
+    rewriter.typeIsGeneric.removeAll()
     rewriter.typesContainingPrint.removeAll() // Reset before visiting
-
+    // Single pass approach now.
     let transformedSyntax = rewriter.visit(sourceFile)
-    // Remove deprecated 'as' cast warning by removing the cast
-    guard var transformedFile = transformedSyntax as? SourceFileSyntax else {
-         fputs("Rewriter failed to return SourceFileSyntax for \\(fileURL.path)\\n", stderr)
-         continue
+
+    // --- Add os.log import (use potentially modified file) ---
+    var finalFile = transformedSyntax // Start with the potentially modified transformedSyntax
+    var hasImport = false
+    for stmt in finalFile.statements { // Check the current statements
+        if let importDecl = stmt.item.as(ImportDeclSyntax.self),
+           importDecl.path.description.trimmingCharacters(in: .whitespaces) == "os.log" { // More robust check
+            hasImport = true
+            break
+        }
+    }
+    if !hasImport {
+        // Use the original, robust import adding logic
+        let importDecl: ImportDeclSyntax
+        do {
+            importDecl = try ImportDeclSyntax("import os.log")
+        } catch {
+            fputs("Failed to create import os.log syntax: \(error)\n", stderr)
+            // Skip adding import if creation fails, maybe log or handle differently
+            importDecl = ImportDeclSyntax(path: ImportPathComponentListSyntax([])) // Placeholder to avoid compiler error, won't be used
+        }
+
+        if !importDecl.path.isEmpty { // Only proceed if importDecl was created successfully
+            var importItem = CodeBlockItemSyntax(item: .decl(DeclSyntax(importDecl)))
+            
+            var statements = finalFile.statements
+            var lastImportIndex: Int? = nil
+
+            // Find the index of the last import statement
+            for (index, stmt) in statements.enumerated().reversed() {
+                if stmt.item.is(ImportDeclSyntax.self) {
+                    lastImportIndex = index
+                    break
+                }
+            }
+
+            if let lastIndex = lastImportIndex {
+                // Insert after the last import
+                let targetIndex = statements.index(statements.startIndex, offsetBy: lastIndex)
+                var lastImportItem = statements[targetIndex]
+                
+                // Ensure the last import has one newline after it
+                if !lastImportItem.trailingTrivia.containsNewlines(count: 1) {
+                    lastImportItem.trailingTrivia = lastImportItem.trailingTrivia + .newlines(1)
+                } // Keep existing trivia if it already has newlines
+                statements[targetIndex] = lastImportItem
+                
+                // Prepare the new import with indent (if possible), but no leading newline
+                let indentTrivia = (lastImportItem.leadingTrivia.indentation(isOnNewline: true) ?? Trivia())
+                importItem.leadingTrivia = indentTrivia
+                importItem.trailingTrivia = .newlines(1) // Add trailing newline
+
+                statements.insert(importItem, at: statements.index(after: targetIndex))
+                
+                // Ensure the *next* code block starts after ONE newline
+                let nextCodeBlockIndex = statements.index(after: statements.index(after: targetIndex))
+                if nextCodeBlockIndex < statements.endIndex {
+                    var nextBlock = statements[nextCodeBlockIndex]
+                    if !(nextBlock.leadingTrivia.containsNewlines(count: 1) && !nextBlock.leadingTrivia.containsNewlines(count: 2)) {
+                        let indent = nextBlock.leadingTrivia.indentation(isOnNewline: true) ?? Trivia()
+                        nextBlock.leadingTrivia = .newlines(1) + indent
+                        statements[nextCodeBlockIndex] = nextBlock
+                    }
+                }
+            } else {
+                // No existing imports, insert at the beginning
+                importItem = importItem.with(\.trailingTrivia, Trivia()) // No trailing trivia initially
+                if let firstStmt = statements.first {
+                    importItem.leadingTrivia = firstStmt.leadingTrivia.removingNewlinesBeforeFirstCommentOrCode()
+                    var mutableFirst = firstStmt
+                    let indent = firstStmt.leadingTrivia.indentation(isOnNewline: true) ?? Trivia()
+                    mutableFirst.leadingTrivia = .newlines(1) + indent // Ensure 1 newline before original first stmt
+                    statements[statements.startIndex] = mutableFirst
+                    importItem.trailingTrivia = .newlines(1) // Add newline after import, before first statement
+                } else {
+                    importItem.trailingTrivia = .newlines(1) // File was empty, just add newline after import
+                }
+                statements.insert(importItem, at: statements.startIndex)
+            }
+            
+            finalFile = finalFile.with(\.statements, statements)
+        }
     }
     
-    // --- Insert pending file-level loggers ---
-   var statements = transformedFile.statements
-   var insertedLoggerCount = 0
-   if !rewriter.pendingFileLevelLoggers.isEmpty {
-       // Find insertion point (after last import or at beginning)
-       var lastImportIndex: Int? = nil
-       for (index, stmt) in statements.enumerated().reversed() {
-           if stmt.item.is(ImportDeclSyntax.self) {
-               lastImportIndex = index
-               break
-           }
-       }
-       let insertionFileIndex = lastImportIndex != nil ? statements.index(after: statements.index(statements.startIndex, offsetBy: lastImportIndex!)) : statements.startIndex
+    // --- Write the file --- 
+    // Check if the file content actually changed before writing
+    let originalContent = try String(contentsOf: fileURL, encoding: .utf8)
+    let finalContent = finalFile.description
+    let contentChanged = originalContent != finalContent
 
-       // Determine indent from the element *after* the insertion point, or default
-       var indentTrivia: Trivia = .spaces(0) // Default if inserting at end or empty file
-       if insertionFileIndex < statements.endIndex {
-           let nextElement = statements[insertionFileIndex]
-           indentTrivia = nextElement.leadingTrivia.indentation(isOnNewline: true) ?? .spaces(0)
-       } else if let lastElement = statements.last {
-           indentTrivia = lastElement.leadingTrivia.indentation(isOnNewline: true) ?? .spaces(0)
-       } else if let impIdx = lastImportIndex {
-           indentTrivia = statements[statements.index(statements.startIndex, offsetBy: impIdx)].leadingTrivia.indentation(isOnNewline: true) ?? .spaces(0)
-       }
-
-       // Insert each logger, sorted by name for deterministic order
-       for (typeName, loggerDeclCode) in rewriter.pendingFileLevelLoggers.sorted(by: { $0.key < $1.key }) {
-           do {
-               guard let stmt = try? Parser.parse(source: loggerDeclCode).statements.first,
-                     let varDecl = stmt.item.as(VariableDeclSyntax.self) else {
-                   fputs("Error parsing file-level logger for \\(typeName): \\(loggerDeclCode)\\n", stderr)
-                   continue
-               }
-               var loggerItem = CodeBlockItemSyntax(item: .decl(DeclSyntax(varDecl)))
-
-               // Add trivia: 2 newlines before (unless first element after imports/at start), indent, 1 newline after
-               let isFirstElement = insertionFileIndex == statements.startIndex
-               let isFirstAfterImports = lastImportIndex != nil && insertionFileIndex == statements.index(after: statements.index(statements.startIndex, offsetBy: lastImportIndex!))
-
-               // Newlines before: 2 unless it's the very first declaration or the first thing after imports
-               let newlinesBefore = (isFirstElement || isFirstAfterImports) && insertedLoggerCount == 0 ? 1 : 2
-
-               loggerItem.leadingTrivia = .newlines(newlinesBefore) + indentTrivia
-               loggerItem.trailingTrivia = .newlines(1)
-
-               // Insert at the calculated index + offset for previously inserted loggers
-               let currentInsertionFileIndex = statements.index(insertionFileIndex, offsetBy: insertedLoggerCount)
-               statements.insert(loggerItem, at: currentInsertionFileIndex)
-               insertedLoggerCount += 1
-
-           } catch {
-               fputs("Error parsing file-level logger for \\(typeName): \\(loggerDeclCode) - \\(error)\\n", stderr)
-           }
-       }
-
-       // Adjust trivia of the *next* non-logger element if loggers were inserted
-       if insertedLoggerCount > 0 {
-           let nextElementActualIndex = statements.index(insertionFileIndex, offsetBy: insertedLoggerCount)
-           if nextElementActualIndex < statements.endIndex {
-               var nextElement = statements[nextElementActualIndex]
-               let originalIndent = nextElement.leadingTrivia.indentation(isOnNewline: true) ?? .spaces(0)
-               // Ensure it starts with exactly TWO newlines + its original indent after logger block
-               let requiredNewlines = 2
-               let newLeadingTrivia = .newlines(requiredNewlines) + originalIndent
-               var mutableNextElement = nextElement // Create mutable copy
-               mutableNextElement.leadingTrivia = newLeadingTrivia
-               statements[nextElementActualIndex] = mutableNextElement // Assign back
-           }
-       }
-
-       // Update the transformed file
-       transformedFile = transformedFile.with(\.statements, statements)
-       // Clear the pending loggers for the next file
-       rewriter.pendingFileLevelLoggers.removeAll()
-   }
-
-   // --- Add os.log import (use potentially modified file) ---
-   var finalFile = transformedFile
-   var hasImport = false
-   for stmt in finalFile.statements {
-       if let importDecl = stmt.item.as(ImportDeclSyntax.self),
-          importDecl.path.description.trimmingCharacters(in: .whitespaces) == "os.log" { // More robust check
-           hasImport = true
-           break
-       }
-   }
-   if !hasImport {
-       let importDecl: ImportDeclSyntax
-       importDecl = try! ImportDeclSyntax("import os.log")
-       var importItem = CodeBlockItemSyntax(item: .decl(DeclSyntax(importDecl)))
-       
-       var statements = finalFile.statements
-       var lastImportIndex: Int? = nil
-
-       // Find the index of the last import statement
-       for (index, stmt) in statements.enumerated().reversed() {
-           if stmt.item.is(ImportDeclSyntax.self) {
-               lastImportIndex = index
-               break
-           }
-       }
-
-       if let lastIndex = lastImportIndex {
-           // Insert after the last import
-           let targetIndex = statements.index(statements.startIndex, offsetBy: lastIndex)
-           var lastImportItem = statements[targetIndex]
-           
-           // Ensure the last import has one newline after it
-           if !lastImportItem.trailingTrivia.containsNewlines(count: 1) {
-                lastImportItem.trailingTrivia = lastImportItem.trailingTrivia + .newlines(1)
-           } else {
-               // It already has at least one, ensure it's exactly one?
-               // Or just keep existing trivia? Keeping existing for now.
-           }
-           statements[targetIndex] = lastImportItem
-           
-           // Prepare the new import with indent (if possible), but no leading newline
-           let indentTrivia = (lastImportItem.leadingTrivia.indentation(isOnNewline: true) ?? Trivia()) // indentation can return nil
-           importItem.leadingTrivia = indentTrivia
-           // Add trailing newline to separate from next code block
-           importItem.trailingTrivia = .newlines(1) 
-
-           // Insert the new import item
-           statements.insert(importItem, at: statements.index(after: targetIndex))
-           
-           // Ensure the *next* code block starts after ONE newline from the imports
-           let nextCodeBlockIndex = statements.index(after: statements.index(after: targetIndex))
-           if nextCodeBlockIndex < statements.endIndex {
-               var nextBlock = statements[nextCodeBlockIndex]
-               // Adjust if it doesn't start with exactly one newline
-               if !(nextBlock.leadingTrivia.containsNewlines(count: 1) && !nextBlock.leadingTrivia.containsNewlines(count: 2)) {
-                   let indent = nextBlock.leadingTrivia.indentation(isOnNewline: true) ?? Trivia()
-                   // Remove extra newlines first, then add exactly one
-                   nextBlock.leadingTrivia = .newlines(1) + indent
-                   statements[nextCodeBlockIndex] = nextBlock
-               }
-           }
-           
-       } else {
-           // No existing imports, insert at the beginning
-            importItem = importItem.with(\.trailingTrivia, Trivia())
-           // Add potential leading trivia from the original first statement
-           if let firstStmt = statements.first {
-                importItem.leadingTrivia = firstStmt.leadingTrivia.removingNewlinesBeforeFirstCommentOrCode()
-                // Ensure ONE newline after the import before the original first statement
-               var mutableFirst = firstStmt
-               let indent = firstStmt.leadingTrivia.indentation(isOnNewline: true) ?? Trivia()
-                mutableFirst.leadingTrivia = .newlines(1) + indent
-               statements[statements.startIndex] = mutableFirst
-           } else {
-                // If the file was empty, just add ONE newline after import
-                importItem.trailingTrivia = .newlines(1)
-           }
-           statements.insert(importItem, at: statements.startIndex)
-       }
-       
-       finalFile = finalFile.with(\.statements, statements)
-   }
-   
-   if options.dryRun && modifiedCount >= 3 { break }
-   do {
-       try finalFile.description.write(to: fileURL, atomically: true, encoding: .utf8)
-       print("Processed: \(fileURL.path)")
-       modifiedCount += 1 // Increment only on successful write
-   } catch {
-       fputs("Failed to write \(fileURL.path): \(error)\n", stderr)
-   }
+    if contentChanged {
+        if options.dryRun && modifiedCount >= 3 { 
+            print("DRY RUN: Would have modified \(fileURL.path)")
+            continue // Don't break, just skip writing for this file in dry run after limit
+        }
+        do {
+            // Write the final version, which includes the import if it was added.
+            try finalContent.write(to: fileURL, atomically: true, encoding: .utf8)
+            print("Processed: \(fileURL.path)")
+            modifiedCount += 1 // Increment only on successful write
+        } catch {
+            fputs("Failed to write \(fileURL.path): \(error)\n", stderr)
+        }
+    }
 }
 
 print("Processing complete. \(modifiedCount) file(s) modified.")
